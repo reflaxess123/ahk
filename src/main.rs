@@ -2,13 +2,12 @@ use std::ffi::{CStr, CString};
 use std::mem;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use once_cell::sync::Lazy;
 use winapi::shared::minwindef::{BOOL, HINSTANCE, LPARAM, LRESULT, WPARAM};
-use winapi::shared::windef::HWND;
+use winapi::shared::windef::{HHOOK, HWND};
 use winapi::um::errhandlingapi::GetLastError;
 use winapi::um::libloaderapi::{GetModuleHandleW, GetProcAddress, LoadLibraryA};
 use winapi::um::winuser::*;
@@ -218,46 +217,60 @@ unsafe extern "system" fn low_level_keyboard_proc(
         let is_key_down = w_param == WM_KEYDOWN as WPARAM || w_param == WM_SYSKEYDOWN as WPARAM;
         let is_key_up = w_param == WM_KEYUP as WPARAM || w_param == WM_SYSKEYUP as WPARAM;
 
-        // Отслеживаем состояние Win клавиш
-        if vk_code == VK_LWIN as u32 || vk_code == VK_RWIN as u32 {
-            WIN_KEY_PRESSED.store(is_key_down, Ordering::Relaxed);
+        // Отслеживаем состояние Win клавиш (VK_LWIN = 0x5B, VK_RWIN = 0x5C)
+        if vk_code == 0x5B || vk_code == 0x5C {
+            if is_key_down {
+                WIN_KEY_PRESSED.store(true, Ordering::Relaxed);
+            } else if is_key_up {
+                WIN_KEY_PRESSED.store(false, Ordering::Relaxed);
+            }
         }
 
-        // Если Win нажат и нажата цифра - обрабатываем
-        if is_key_down && WIN_KEY_PRESSED.load(Ordering::Relaxed) {
+        // Блокируем ВСЕ события для Win + цифры (как KEYDOWN так и KEYUP)
+        let win_is_pressed = WIN_KEY_PRESSED.load(Ordering::Relaxed);
+        if win_is_pressed && (is_key_down || is_key_up) {
             match vk_code {
                 0x31..=0x39 => {
-                    // Цифры 1-9
-                    let desktop_number = (vk_code - 0x31) as i32;
-                    println!("Перехватили Win + {}", desktop_number + 1);
-                    
-                    if let Some(ref vda) = VDA_INSTANCE {
-                        let current_desktop = vda.get_current_desktop();
-                        LAST_DESKTOP = Some(current_desktop);
+                    // Цифры 1-9 - обрабатываем только на KEYDOWN
+                    if is_key_down {
+                        let desktop_number = (vk_code - 0x31) as i32;
+                        println!("Перехватили Win + {}", desktop_number + 1);
                         
-                        if let Err(e) = switch_to_desktop_static(vda, desktop_number) {
-                            println!("Ошибка переключения: {}", e);
+                        if let Some(ref vda) = VDA_INSTANCE {
+                            let current_desktop = vda.get_current_desktop();
+                            LAST_DESKTOP = Some(current_desktop);
+                            
+                            if let Err(e) = switch_to_desktop_static(vda, desktop_number) {
+                                println!("Ошибка переключения: {}", e);
+                            }
                         }
                     }
                     
-                    return 1; // Блокируем передачу клавиши дальше
+                    // Блокируем и KEYDOWN и KEYUP для Win + цифры
+                    return 1;
                 }
                 0x30 => {
-                    // Цифра 0 - показать информацию
-                    if let Some(ref vda) = VDA_INSTANCE {
-                        let current = vda.get_current_desktop();
-                        let total = vda.get_desktop_count();
-                        println!("📊 Текущий рабочий стол: {}/{}", current + 1, total);
+                    // Цифра 0 - показать информацию, только на KEYDOWN
+                    if is_key_down {
+                        if let Some(ref vda) = VDA_INSTANCE {
+                            let current = vda.get_current_desktop();
+                            let total = vda.get_desktop_count();
+                            println!("📊 Текущий рабочий стол: {}/{}", current + 1, total);
+                        }
                     }
-                    return 1; // Блокируем передачу клавиши дальше
-                }
-                VK_ESCAPE => {
-                    println!("Получен сигнал выхода...");
-                    PostQuitMessage(0);
+                    
+                    // Блокируем и KEYDOWN и KEYUP для Win + 0
                     return 1;
                 }
                 _ => {}
             }
+        }
+
+        // Отдельная обработка Escape (без Win)
+        if vk_code == 0x1B && is_key_down {
+            println!("Получен сигнал выхода...");
+            PostQuitMessage(0);
+            return 1;
         }
     }
 
